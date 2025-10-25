@@ -1,0 +1,194 @@
+name: "Automação de Verificação de Carteirinhas e Sincronização Supabase"
+
+description: |
+  Este projeto transforma o script atual baseado em planilhas Excel ("Carteirinhas") em uma aplicação automatizada, 
+  escalável e integrada ao banco de dados Supabase. 
+  A automação realiza varreduras diárias e semanais das carteirinhas, armazena e atualiza guias no banco de dados,
+  e fornece uma API para consultas e atualizações sob demanda. 
+  A execução paralela será gerenciada por Docker + Selenoid, permitindo múltiplas instâncias simultâneas de navegador.
+
+objectives:
+  - Migrar armazenamento de planilhas locais para tabelas Supabase.
+  - Criar estrutura relacional entre pagamentos, carteirinhas, agendamentos e guias.
+  - Automatizar varreduras diárias, semanais e sob demanda (via API).
+  - Permitir processamento paralelo de múltiplas carteirinhas.
+  - Atualizar guias existentes sem duplicação de registros.
+  - Oferecer endpoints de API seguros e escaláveis para integração com sistemas externos.
+
+---
+
+environment_variables:
+  description: |
+    As credenciais de acesso ao banco de dados e configurações da automação deverão ser definidas no arquivo `.env`, 
+    localizado na raiz do projeto. O arquivo não deve ser versionado (adicionar ao `.gitignore`).
+  file: ".env"
+  structure:
+    SUPABASE_URL: "https://<projeto>.supabase.co"
+    SUPABASE_KEY: "<chave-de-api-do-supabase>"
+    SUPABASE_DB_NAME: "<nome-do-banco>"
+    SUPABASE_DB_USER: "<usuario>"
+    SUPABASE_DB_PASSWORD: "<senha>"
+    SUPABASE_DB_HOST: "<host>"
+    SUPABASE_DB_PORT: "5432"
+
+    # Configurações de execução da automação
+    SELENOID_URL: "http://localhost:4444/wd/hub"
+    SELENOID_BROWSER: "chrome"
+    SELENOID_INSTANCES: "10"
+    SELENOID_HEADLESS: "true"
+
+    # Agendamento automático
+    DAILY_SCAN_TIME: "19:00"
+    WEEKLY_SCAN_DAY: "saturday"
+    WEEKLY_SCAN_TIME: "19:00"
+
+    # Autenticação da API
+    API_TOKEN: "<chave-secreta-para-autenticacao>"
+
+---
+
+database:
+  engine: "Supabase (PostgreSQL)"
+  credentials_source: ".env"
+  tables:
+    - name: "Pagamentos"
+      columns:
+        - { name: "id", type: "serial", primary_key: true }
+        - { name: "nome", type: "text" }
+        - { name: "status", type: "text" }
+
+    - name: "Carteirinhas"
+      columns:
+        - { name: "id", type: "serial", primary_key: true }
+        - { name: "carteiras", type: "text" }
+        - { name: "paciente", type: "text" }
+        - { name: "id_pagamento", type: "integer", foreign_key: "Pagamentos.id" }
+        - { name: "status", type: "text" }
+
+    - name: "Agendamentos"
+      columns:
+        - { name: "id_atendimento", type: "serial", primary_key: true }
+        - { name: "unidade", type: "text" }
+        - { name: "carteirinha", type: "text" }
+        - { name: "cod_paciente", type: "text" }
+        - { name: "paciente", type: "text" }
+        - { name: "pagamento", type: "text" }
+        - { name: "data", type: "date" }
+        - { name: "hora_inicial", type: "time" }
+        - { name: "sala", type: "text" }
+        - { name: "id_profissional", type: "integer" }
+        - { name: "profissional", type: "text" }
+        - { name: "tipo_atend", type: "text" }
+        - { name: "qtd_sess", type: "integer" }
+        - { name: "status", type: "text" }
+        - { name: "elegibilidade", type: "text" }
+        - { name: "substituicao", type: "text" }
+        - { name: "tipo_falta", type: "text" }
+        - { name: "id_pai", type: "integer" }
+        - { name: "codigo_faturamento", type: "text" }
+
+    - name: "BaseGuias"
+      columns:
+        - { name: "id", type: "serial", primary_key: true }
+        - { name: "id_paciente", type: "integer" }
+        - { name: "id_pagamento", type: "integer" }
+        - { name: "carteirinha", type: "text" }
+        - { name: "paciente", type: "text" }
+        - { name: "guia", type: "text" }
+        - { name: "data_autorizacao", type: "date" }
+        - { name: "senha", type: "text" }
+        - { name: "validade", type: "date" }
+        - { name: "codigo_terapia", type: "text" }
+        - { name: "qtde_solicitado", type: "integer" }
+        - { name: "sessoes_autorizadas", type: "integer" }
+
+---
+
+functionality:
+  main_function: "vasculhar_carteirinhas"
+  description: |
+    Função principal da automação, responsável por varrer e atualizar os dados de carteirinhas.
+    Pode ser executada manualmente via API ou automaticamente via cron.
+  parameters:
+    - { name: "modo_execucao", type: "string", options: ["diario", "semanal", "manual"] }
+    - { name: "carteirinha", type: "string", optional: true, description: "Executa varredura de uma carteirinha específica" }
+    - { name: "data_inicial", type: "date", optional: true }
+    - { name: "data_final", type: "date", optional: true }
+  logic:
+    - Verifica se a execução é diária, semanal ou manual.
+    - Busca no Supabase as carteirinhas a serem processadas.
+    - Cria múltiplas instâncias de navegador (via Docker + Selenoid) para realizar as consultas.
+    - Armazena os resultados em "BaseGuias".
+    - Se a guia já existir, atualiza os dados novos.
+
+---
+
+api:
+  name: "API de Controle e Consulta de Carteirinhas"
+  authentication: "Token JWT"
+  endpoints:
+    - path: "/verificar_carteirinha"
+      method: "POST"
+      description: "Permite a verificação de uma carteirinha específica."
+      parameters:
+        - { name: "carteirinha", type: "string", required: true }
+
+    - path: "/atualizar_intervalo"
+      method: "POST"
+      description: "Solicita atualização de guias por intervalo de datas."
+      parameters:
+        - { name: "data_inicial", type: "date", required: true }
+        - { name: "data_final", type: "date", required: true }
+
+  responses:
+    success: { code: 200, message: "Operação concluída com sucesso" }
+    error: { code: 500, message: "Erro na execução da automação" }
+
+---
+
+infrastructure:
+  docker:
+    description: "Usado para empacotar e executar múltiplas instâncias de navegador via Selenoid."
+    compose_example: |
+      version: "3"
+      services:
+        selenoid:
+          image: aerokube/selenoid
+          ports:
+            - "4444:4444"
+          volumes:
+            - "/var/run/docker.sock:/var/run/docker.sock"
+          environment:
+            - OVERRIDE_VIDEO_OUTPUT_DIR=/opt/selenoid/video
+
+  parallel_processing:
+    engine: "Selenoid"
+    config:
+      instances: 10
+      browser: "chrome"
+      headless: true
+
+---
+
+logging:
+  level: "INFO"
+  destination: "Arquivo local + Tabela de logs no Supabase"
+  content:
+    - timestamp
+    - tipo_execucao
+    - status
+    - tempo_execucao
+    - carteirinhas_processadas
+    - guias_inseridas
+    - guias_atualizadas
+
+---
+
+notifications:
+  channels:
+    - "E-mail"
+    - "Webhook (para integração com sistemas externos)"
+  triggers:
+    - "Conclusão de varredura diária"
+    - "Conclusão de varredura semanal"
+    - "Erro de execução"

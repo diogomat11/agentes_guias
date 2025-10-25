@@ -1,0 +1,211 @@
+project:
+  name: "Fila Supabase + Workers Locais (SGUCARD)"
+  goals:
+    - "API online cria jobs individuais (ad hoc)"
+    - "Agendamento diário/semanal por agente local"
+    - "Execução distribuída em 3 computadores (2 instâncias cada)"
+    - "Evitar duplicidade com lock atômico e idempotência"
+    - "Respeitar frescor de 6h, com opção de force"
+    - "Observabilidade e segurança via Supabase/REST/RPC"
+
+  environment:
+    runtime: "Python 3.13, FastAPI (API online opcional), Supabase REST"
+    os: "Windows (workers/scheduler via Task Scheduler ou serviço)"
+    env_vars:
+      - "SUPABASE_URL"
+      - "SUPABASE_SERVICE_ROLE_KEY"
+      - "SUPABASE_ANON_KEY"
+      - "WORKER_ID"
+      - "MAX_LOCAL_CONCURRENCY=2"
+      - "CLAIM_BATCH_SIZE=2"
+      - "VISIBILITY_TIMEOUT_SECONDS=900"
+      - "HEARTBEAT_INTERVAL_SECONDS=30"
+      - "RECHECK_INTERVAL_HOURS=6"
+      - "SCHEDULE_DAILY_TIME=19:00"
+      - "SCHEDULE_WEEKLY_DAY='domingo'"
+
+  data_model:
+    tables:
+      Job_carteiras:
+        columns:
+          - "id uuid pk default uuid_generate_v4()"
+          - "type text not null check in ('sgucard')"
+          - "carteirinha text not null"
+          - "carteira text not null"
+          - "id_paciente text null"
+          - "Pagamento text null"
+          - "category text check in ('scheduled_daily','scheduled_weekly','adhoc')"
+          - "status text not null default 'pending' check in ('pending','processing','success','error','cancelled')"
+          - "priority smallint default 5"
+          - "scheduled_for timestamptz null"
+          - "force boolean default false"
+          - "min_recheck_interval_hours int default 6"
+          - "attempts int default 0"
+          - "max_attempts int default 3"
+          - "locked_by text null"
+          - "locked_at timestamptz null"
+          - "locked_until timestamptz null"
+          - "visibility_timeout_seconds int default 900"
+          - "last_heartbeat_at timestamptz null"
+          - "idempotency_key text unique null"
+          - "scheduled_bucket text null  # ex: '2025-10-25' (daily) ou '2025-W42' (weekly)"
+          - "result jsonb null"
+          - "error text null"
+          - "created_at timestamptz default now()"
+          - "updated_at timestamptz default now()"
+        indexes:
+          - "idx_job_carteiras_status(status)"
+          - "idx_job_carteiras_scheduled_for(scheduled_for)"
+          - "idx_job_carteiras_priority(priority)"
+          - "idx_job_carteiras_carteirinha(carteirinha)"
+          - "idx_job_carteiras_carteira(carteira)"
+          - "idx_job_carteiras_locked_until(locked_until)"
+        constraints:
+          - "unique (carteira, category, scheduled_bucket)"
+      job_logs:
+        columns:
+          - "id bigserial pk"
+          - "job_id uuid not null"
+          - "worker_id text"
+          - "status text"
+          - "message text"
+          - "created_at timestamptz default now()"
+        indexes:
+          - "idx_job_logs_job_id(job_id)"
+      carteiras_state:
+        columns:
+          - "carteirinha text pk"
+          - "last_success_at timestamptz null"
+          - "last_error_at timestamptz null"
+          - "updated_at timestamptz default now()"
+        indexes:
+          - "idx_carteiras_state_last_success(last_success_at)"
+    rls:
+      Job_carteiras:
+        - "policy_insert_anon_for_api_online (permit insert adhoc)"
+        - "policy_update_worker_only (service_role required para update/claim/complete)"
+      job_logs:
+        - "policy_insert_worker_only"
+      carteiras_state:
+        - "policy_select_worker_and_api"
+    retention:
+      - "Job_carteiras: purge > 30 dias (exceto audit crítico)"
+      - "job_logs: purge > 90 dias"
+
+  rpc_functions:
+    - name: "claim_jobs(worker_id text, claim_limit int)"
+      description: "Atualiza atomically 'pending' → 'processing' com lock, returns claimed rows"
+      logic: |
+        WITH to_claim AS (
+          SELECT j.id
+          FROM Job_carteiras j
+          WHERE j.status = 'pending'
+            AND (j.scheduled_for IS NULL OR j.scheduled_for <= now())
+            AND (j.force = true OR (
+                 now() - COALESCE((SELECT c.last_success_at
+                                    FROM carteiras_state c
+                                    WHERE c.carteirinha = j.carteirinha),
+                                   TIMESTAMP 'epoch') >= (j.min_recheck_interval_hours || ' hours')::interval))
+          ORDER BY j.priority ASC, j.created_at ASC
+          LIMIT claim_limit
+        )
+        UPDATE Job_carteiras j
+        SET status = 'processing',
+            locked_by = worker_id,
+            locked_at = now(),
+            locked_until = now() + (j.visibility_timeout_seconds || ' seconds')::interval,
+            attempts = j.attempts + 1,
+            updated_at = now()
+        FROM to_claim tc
+        WHERE j.id = tc.id
+        RETURNING j.*;
+    - name: "heartbeat_job(job_id uuid, worker_id text)"
+      description: "Renova 'locked_until' para job processado pelo worker"
+      logic: "UPDATE Job_carteiras SET last_heartbeat_at = now(), locked_until = now() + (visibility_timeout_seconds || ' seconds')::interval WHERE id=job_id AND locked_by=worker_id;"
+    - name: "complete_job(job_id uuid, worker_id text, result jsonb)"
+      description: "Marca success e atualiza estado da carteirinha"
+      logic: |
+        UPDATE Job_carteiras
+        SET status='success', locked_by=NULL, locked_at=NULL, locked_until=NULL,
+            result=result, updated_at=now()
+        WHERE id=job_id AND locked_by=worker_id;
+        UPDATE carteiras_state
+        SET last_success_at=now(), updated_at=now()
+        WHERE carteirinha = (SELECT carteirinha FROM Job_carteiras WHERE id=job_id);
+    - name: "fail_job(job_id uuid, worker_id text, error text)"
+      description: "Marca erro, reencaminha ou DLQ conforme tentativas"
+      logic: |
+        UPDATE Job_carteiras
+        SET status = CASE WHEN attempts+1 >= max_attempts THEN 'error' ELSE 'pending' END,
+            error = error, locked_by=NULL, locked_at=NULL, locked_until=NULL, updated_at=now(),
+            attempts = attempts + 1
+        WHERE id=job_id AND locked_by=worker_id;
+    - name: "release_expired_locks()"
+      description: "Libera locks vencidos"
+      logic: "UPDATE Job_carteiras SET status='pending', locked_by=NULL, locked_at=NULL, locked_until=NULL WHERE status='processing' AND locked_until < now() RETURNING id;"
+    - name: "purge_scheduled(category text, bucket text)"
+      description: "Limpa jobs agendados do bucket, sem afetar 'processing'"
+      logic: "DELETE FROM Job_carteiras WHERE category=category AND scheduled_bucket=bucket AND status != 'processing';"
+
+  api_online:
+    endpoints:
+      - "POST /trigger/sgucard { carteirinha, force=false, priority } → insere Job_carteiras 'adhoc' (202 Accepted)"
+      - "GET /job_carteiras?status=... → leitura (REST Supabase, token required)"
+      - "GET /logs?limit=N → leitura (existente/expandir)"
+    security:
+      - "JWT Bearer obrigatório; rate limit por IP/cliente"
+      - "RLS: insert only; updates via worker (service role)"
+
+  local_agents:
+    scheduler:
+      role: "Criar jobs diários (SCHEDULE_DAILY_TIME) e semanais"
+      actions:
+        - "purge_scheduled(category='scheduled_daily', bucket=hoje)"
+        - "insert jobs (carteirinhas da lista) com idempotency_key e bucket diário"
+        - "purge_scheduled(category='scheduled_weekly', bucket=semana_atual)"
+        - "insert jobs semanais com idempotency_key"
+    worker:
+      role: "Consumir jobs em lote, orquestrar 2 agentes por máquina"
+      loop:
+        - "Se slots livres: rpc.claim_jobs(WORKER_ID, CLAIM_BATCH_SIZE)"
+        - "Para cada job: spawn agente (processo) que chama automação local (Selenium/SGUCARD)"
+        - "Heartbeat periódico; timeout por job"
+        - "Ao concluir: rpc.complete_job(...) ou rpc.fail_job(...)"
+      concurrency:
+        - "MAX_LOCAL_CONCURRENCY=2 por computador; total 6"
+      chrome_profiles:
+        - "Diretório de perfil único por agente para evitar conflitos"
+
+  observability:
+    metrics:
+      - "queue_depth, processing_count, success_rate, error_rate"
+      - "latency_enqueued_to_start, latency_start_to_finish"
+      - "expired_locks_count, retries_count, dlq_count"
+    dashboards:
+      - "Consultas prontas via REST/SQL + páginas em FastAPI ou Edge"
+    alerts:
+      - "pending>threshold por X min, error_rate>threshold, locks_expired altos"
+
+  test_plan:
+    cases:
+      - "Claim concorrente com 3 workers → sem duplicidade (verificar locked_by)"
+      - "Respeito ao frescor 6h (simular last_success_at recente)"
+      - "force=true ignora frescor"
+      - "Purge diário/semana não afeta jobs 'processing'"
+      - "Lock expirado reentra em pending"
+      - "Idempotência: não duplica (unique por bucket)"
+      - "Backpressure: backlog mantém pending; API responde 202"
+
+  checklist:
+    - "[ ] Criar tabelas: Job_carteiras, job_logs, carteiras_state"
+    - "[ ] Índices e constraints (unique por bucket; idempotency_key)"
+    - "[ ] Políticas RLS (insert por API; update por worker)"
+    - "[ ] RPC: claim_jobs, heartbeat_job, complete_job, fail_job, release_expired_locks, purge_scheduled"
+    - "[ ] API online: POST /trigger/sgucard (ad hoc), leitura básica"
+    - "[ ] Scheduler local: purge+create diário e semanal (às 19:00)"
+    - "[ ] Worker local: semáforo 2 agentes, heartbeat, timeouts"
+    - "[ ] Integração com automação SGUCARD (perfil Chrome por agente)"
+    - "[ ] Observabilidade: métricas, logs correlacionados por job_id"
+    - "[ ] Segurança: tokens, RLS, rate limit"
+    - "[ ] Testes de concorrência, frescor, idempotência, reentrância"
+    - "[ ] Pipeline de deploy (Edge Functions ou FastAPI hospedado)"
