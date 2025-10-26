@@ -67,6 +67,33 @@ CLAIM_BATCH_SIZE=1
 POLL_INTERVAL_SECONDS=5
 ```
 
+### Distribuição Multiservidor (Worker)
+
+- `API_SERVER_URLS` — lista de instâncias da API separadas por `,`. Exemplo: `http://127.0.0.1:8001,http://127.0.0.1:8002,http://127.0.0.1:8003`.
+- `HEALTHCHECK_PATH` — caminho usado no healthcheck. Padrão: `/`.
+- `HEALTHCHECK_TIMEOUT_SECONDS` — timeout do healthcheck. Recomendo `5`.
+- `HEALTHCHECK_CACHE_SECONDS` — cache do resultado do healthcheck. Recomendo `5` para recuperação rápida.
+- `DISPATCH_STAGGER_SECONDS` — atraso entre despachos de jobs por servidor. Recomendo `10`.
+- `CARTEIRINHA_API_TIMEOUT` — timeout das chamadas à API. Recomendo `900`.
+
+Exemplo de `.env` para distribuição com 3 servidores:
+
+```env
+API_SERVER_URLS=http://127.0.0.1:8001,http://127.0.0.1:8002,http://127.0.0.1:8003
+HEALTHCHECK_PATH=/
+HEALTHCHECK_TIMEOUT_SECONDS=5
+HEALTHCHECK_CACHE_SECONDS=5
+DISPATCH_STAGGER_SECONDS=10
+CARTEIRINHA_API_TIMEOUT=900
+```
+
+Dicas:
+- Copie `/.env.example` para `/.env` e ajuste conforme ambiente.
+- Suba múltiplas instâncias da API:
+  - `python -m uvicorn api_carteirinhas:app --host 127.0.0.1 --port 8001`
+  - `python -m uvicorn api_carteirinhas:app --host 127.0.0.1 --port 8002`
+  - `python -m uvicorn api_carteirinhas:app --host 127.0.0.1 --port 8003`
+
 ### 3. Configuração do Banco
 
 ```bash

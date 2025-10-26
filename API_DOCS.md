@@ -121,6 +121,25 @@ curl.exe -X POST "http://127.0.0.1:8002/sgucard/intervalo" ^
 
 - Configure `.env` com `API_TOKEN`, credenciais Supabase e variáveis necessárias.
 - Em produção, prefira `http://localhost:8002` e um reverse proxy conforme necessidade.
+- Em clusters, o worker usa `HEALTHCHECK_PATH` (padrão `/`) e considera saudável qualquer resposta `2xx`. Garanta que `/` ou `/health` responda `2xx`.
+- Para múltiplas instâncias, configure `API_SERVER_URLS` no `.env` do worker com as URLs das APIs.
+- O despacho é escalonado por `DISPATCH_STAGGER_SECONDS` (ex.: `10`), e o número de jobs por ciclo acompanha o número de servidores saudáveis.
+
+## Exemplos de Healthcheck em cluster
+
+curl (Windows):
+```
+# Verificar raiz (padrão do worker)
+curl.exe http://127.0.0.1:8001/
+curl.exe http://127.0.0.1:8002/
+curl.exe http://127.0.0.1:8003/
+
+# Verificar endpoint dedicado
+curl.exe http://127.0.0.1:8001/health
+curl.exe http://127.0.0.1:8002/health
+curl.exe http://127.0.0.1:8003/health
+```
+
 
 ## Exemplos por Linguagem
 
