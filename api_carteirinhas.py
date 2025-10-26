@@ -83,12 +83,21 @@ class LogEntry(BaseModel):
     guias_atualizadas: int
     mensagem: Optional[str]
 
-# Instância global da automação (lazy)
-automacao = None
+# Novo modelo para criação de jobs
+class JobCreateRequest(BaseModel):
+    type: Optional[str] = Field(default="sgucard", description="Tipo do job")
+    carteirinha: str = Field(..., description="Carteirinha alvo do job")
+    carteira: Optional[str] = Field(default=None, description="Carteira (se diferente da carteirinha)")
+    id_paciente: Optional[str] = Field(default=None, description="ID do paciente (opcional)")
 
 def get_automacao():
     """Inicializa AutomacaoCarteirinhas sob demanda para evitar conexão ao DB no import."""
     global automacao
+    # Evitar NameError se a variável global ainda não existir
+    try:
+        _ = automacao
+    except NameError:
+        automacao = None
     if automacao is None:
         try:
             automacao = AutomacaoCarteirinhas()
@@ -501,3 +510,25 @@ if __name__ == "__main__":
         reload=True,
         log_level="info"
     )
+
+# Endpoint para criar job de carteirinha
+@app.post("/jobs", tags=["Jobs"])
+async def criar_job(request: JobCreateRequest, token: str = Depends(verify_token)):
+    try:
+        db_manager = DatabaseManager()
+        result = db_manager.insert_job_carteirinha(
+            type=request.type,
+            carteirinha=request.carteirinha,
+            carteira=request.carteira or request.carteirinha,
+            id_paciente=request.id_paciente
+        )
+        return {
+            "status": "created",
+            "job": result.get("job", result),
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao criar job: {str(e)}"
+        )

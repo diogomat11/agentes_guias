@@ -44,6 +44,29 @@ API_TOKEN=seu_token_api
 SELENOID_URL=http://localhost:4444/wd/hub
 ```
 
+### Variáveis de Ambiente do Worker
+
+Estas variáveis controlam como o worker consome a API e processa jobs:
+
+- `CARTEIRINHA_API_BASE_URL` — Base da API. Padrão: `http://127.0.0.1:8002`
+- `VERIFICAR_CARTEIRINHA_URL` — URL completa do endpoint. Se definida, sobrescreve a base.
+- `EXECUTAR_WEBSCRAPING_REAL_URL` — URL completa para webscraping real (opcional).
+- `CARTEIRINHA_API_TIMEOUT` — Timeout em segundos para chamadas HTTP. Padrão: `30`
+- `WORKER_ID` — Identificador do worker. Padrão: `worker-carteirinhas`
+- `CLAIM_BATCH_SIZE` — Quantidade de jobs por ciclo. Padrão: `1`
+- `POLL_INTERVAL_SECONDS` — Intervalo entre polls quando não há jobs. Padrão: `5`
+
+Exemplo de `.env` para o worker:
+
+```env
+CARTEIRINHA_API_BASE_URL=http://127.0.0.1:8002
+VERIFICAR_CARTEIRINHA_URL=
+CARTEIRINHA_API_TIMEOUT=30
+WORKER_ID=worker-carteirinhas
+CLAIM_BATCH_SIZE=1
+POLL_INTERVAL_SECONDS=5
+```
+
 ### 3. Configuração do Banco
 
 ```bash

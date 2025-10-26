@@ -614,5 +614,50 @@ def SGUCARD(modo: str = 'todos', carteirinha: str = None, data_inicial: str = No
     lista = obter_carteirinhas_por_modo(modo, carteirinha, data_inicial, data_final)
     ConsultGuias(driver, lista)
 
+class WebScrapingRealAutomacao:
+    def executar_automacao_completa(self, filtro_api: str = "manual", carteira: str = None, data_inicio: str = None, data_fim: str = None) -> dict:
+        """Interface compatível com automacao_carteirinhas.vasculhar_carteirinhas.
+        Executa o SGUCARD conforme o filtro e retorna resumo.
+        """
+        start_ts = time.time()
+        try:
+            # Mapear o filtro para o modo usado em SGUCARD/obter_carteirinhas_por_modo
+            if filtro_api == "manual" and carteira:
+                modo = "unico"
+            elif filtro_api == "intervalo" and data_inicio and data_fim:
+                modo = "intervalo"
+            else:
+                modo = "todos"
+
+            # Pré-contar carteirinhas a serem processadas
+            try:
+                lista = obter_carteirinhas_por_modo(modo, carteira, data_inicio, data_fim)
+                count_carteirinhas = len(lista)
+            except Exception:
+                count_carteirinhas = 0
+
+            # Executa automação real (abre Chrome respeitando SGUCARD_HEADLESS)
+            SGUCARD(modo=modo, carteirinha=carteira, data_inicial=data_inicio, data_final=data_fim)
+
+            elapsed = int(time.time() - start_ts)
+            hh = elapsed // 3600
+            mm = (elapsed % 3600) // 60
+            ss = elapsed % 60
+            return {
+                "sucesso": True,
+                "carteirinhas_processadas": count_carteirinhas,
+                # Sem contador de guias no fluxo atual; retornamos 0 por ora
+                "guias_extraidas": 0,
+                "tempo_execucao": f"{hh:02d}:{mm:02d}:{ss:02d}"
+            }
+        except Exception as e:
+            return {
+                "sucesso": False,
+                "erro": str(e),
+                "carteirinhas_processadas": 0,
+                "guias_extraidas": 0,
+                "tempo_execucao": "00:00:00"
+            }
+
 if __name__ == "__main__":
     SGUCARD('unico', '0064.2959.000015.11-1')

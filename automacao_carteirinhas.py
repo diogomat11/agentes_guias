@@ -366,7 +366,489 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Erro ao buscar carteirinha de exemplo: {str(e)}")
             return None
-    
+
+    # Métodos de Jobs (RPC Supabase)
+    def claim_jobs(self, worker_id: str, claim_limit: int = 1) -> List[Dict]:
+        """Reivindica jobs pendentes via RPC no Supabase."""
+        try:
+            if not getattr(self, 'supabase', None):
+                logger.warning("Supabase não inicializado; claim_jobs retorna vazio")
+                return []
+            res = self.supabase.rpc('claim_jobs', {
+                'worker_id': worker_id,
+                'claim_limit': claim_limit
+            }).execute()
+            data = getattr(res, 'data', None)
+            if data is None:
+                logger.info("Nenhum job retornado pelo RPC claim_jobs")
+                return []
+            return data
+        except Exception as e:
+            logger.error(f"Erro ao reivindicar jobs: {e}")
+            return []
+
+    def complete_job(self, job_id: str, worker_id: str, result: Dict) -> bool:
+        """Marca job como concluído via RPC no Supabase."""
+        try:
+            if not getattr(self, 'supabase', None):
+                logger.warning("Supabase não inicializado; complete_job ignorado")
+                return False
+            res = self.supabase.rpc('complete_job', {
+                'job_id': job_id,
+                'worker_id': worker_id,
+                'result': result
+            }).execute()
+            data = getattr(res, 'data', None)
+            return bool(data)
+        except Exception as e:
+            logger.error(f"Erro ao completar job {job_id}: {e}")
+            return False
+
+    def fail_job(self, job_id: str, worker_id: str, error: str) -> bool:
+        """Marca job como falho e retorna para 'pending' ou 'error' conforme tentativas."""
+        try:
+            if not getattr(self, 'supabase', None):
+                logger.warning("Supabase não inicializado; fail_job ignorado")
+                return False
+            res = self.supabase.rpc('fail_job', {
+                'job_id': job_id,
+                'worker_id': worker_id,
+                'error': error
+            }).execute()
+            data = getattr(res, 'data', None)
+            return bool(data)
+        except Exception as e:
+            logger.error(f"Erro ao marcar falha no job {job_id}: {e}")
+            return False
+
+    # Fallback simples baseado em tabela job_carteirinhas
+    def insert_job_carteirinha(self, type: str, carteirinha: str, carteira: Optional[str] = None, id_paciente: Optional[str] = None) -> Dict:
+        try:
+            payload = {
+                'type': type,
+                'carteirinha': carteirinha,
+                'carteira': carteira or carteirinha,
+                'id_paciente': id_paciente
+            }
+            if getattr(self, 'supabase', None):
+                res = self.supabase.table('job_carteirinhas').insert(payload).execute()
+                data = getattr(res, 'data', None)
+                return {'status': 'created', 'job': data[0] if data else payload}
+            # SQL fallback
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "INSERT INTO job_carteirinhas (type, carteirinha, carteira, id_paciente) VALUES (%s, %s, %s, %s) RETURNING id",
+                (payload['type'], payload['carteirinha'], payload['carteira'], payload['id_paciente'])
+            )
+            job_id = cursor.fetchone()[0]
+            self.connection.commit()
+            cursor.close()
+            payload['id'] = job_id
+            return {'status': 'created', 'job': payload}
+        except Exception as e:
+            logger.error(f"Erro ao inserir job_carteirinha: {e}")
+            raise
+
+    def fetch_jobs_simple(self, limit: int = 1, statuses: Optional[List[str]] = None) -> List[Dict]:
+        try:
+            statuses = statuses or ['pending', 'error']
+            if getattr(self, 'supabase', None):
+                # Buscar por múltiplos status via Supabase REST
+                res = (
+                    self.supabase
+                        .table('job_carteirinhas')
+                        .select('*')
+                        .eq('type', 'sgucard')
+                        .in_('status', statuses)
+                        .order('created_at', desc=False)
+                        .limit(limit)
+                        .execute()
+                )
+                data = getattr(res, 'data', None) or []
+                return data
+            # Fallback SQL direto
+            cursor = self.connection.cursor()
+            # Montar placeholders para IN
+            placeholders = ','.join(['%s'] * len(statuses))
+            query = (
+                f"SELECT id, type, carteirinha, carteira, id_paciente "
+                f"FROM job_carteirinhas "
+                f"WHERE type = 'sgucard' AND status IN ({placeholders}) "
+                f"ORDER BY created_at ASC LIMIT %s"
+            )
+            cursor.execute(query, (*statuses, limit))
+            rows = cursor.fetchall()
+            cursor.close()
+            jobs = []
+            for r in rows:
+                jobs.append({'id': r[0], 'type': r[1], 'carteirinha': r[2], 'carteira': r[3], 'id_paciente': r[4]})
+            return jobs
+        except Exception as e:
+            logger.error(f"Erro ao buscar jobs simples: {e}")
+            return []
+
+    def start_job_processing(self, job_id: str, worker_id: str, visibility_timeout_seconds: int = 900) -> bool:
+        try:
+            # Tentar via Supabase REST
+            if getattr(self, 'supabase', None):
+                try:
+                    res = (
+                        self.supabase
+                            .table('job_carteirinhas')
+                            .update({
+                                'status': 'processing',
+                                'locked_by': worker_id,
+                                'locked_at': datetime.now().isoformat(),
+                                'locked_until': (datetime.now() + timedelta(seconds=visibility_timeout_seconds)).isoformat(),
+                                'attempts': (1)  # será incrementado no SQL fallback; aqui apenas sinaliza início
+                            })
+                            .eq('id', job_id)
+                            .in_('status', ['pending', 'error'])
+                            .execute()
+                    )
+                    data = getattr(res, 'data', None) or []
+                    return len(data) > 0
+                except Exception as e:
+                    logger.warning(f"Supabase REST start_job_processing falhou: {e}")
+            # Fallback SQL direto com condição de status
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute(
+                    """
+                    UPDATE job_carteirinhas
+                    SET status='processing',
+                        locked_by=%s,
+                        locked_at=NOW(),
+                        locked_until=NOW() + (visibility_timeout_seconds || ' seconds')::interval,
+                        attempts=attempts+1,
+                        updated_at=NOW()
+                    WHERE id=%s AND status IN ('pending','error')
+                    RETURNING id
+                    """,
+                    (worker_id, job_id)
+                )
+                updated = cursor.fetchone()
+                self.connection.commit()
+                cursor.close()
+                return bool(updated)
+            except Exception as e:
+                cursor.close()
+                logger.error(f"Erro ao marcar job {job_id} como processing: {e}")
+                return False
+        except Exception as e:
+            logger.error(f"Falha em start_job_processing para job {job_id}: {e}")
+            return False
+
+    def mark_job_processed(self, job_id: str) -> bool:
+        try:
+            if getattr(self, 'supabase', None):
+                try:
+                    self.supabase.table('job_carteirinhas').update({
+                        'status': 'success',
+                        'locked_by': None,
+                        'locked_at': None,
+                        'locked_until': None,
+                        'updated_at': datetime.now().isoformat()
+                    }).eq('id', job_id).execute()
+                    return True
+                except Exception:
+                    try:
+                        cursor = self.connection.cursor()
+                        cursor.execute("UPDATE job_carteirinhas SET status='success', locked_by=NULL, locked_at=NULL, locked_until=NULL, updated_at=NOW() WHERE id=%s", (job_id,))
+                        self.connection.commit()
+                        cursor.close()
+                        return True
+                    except Exception as _:
+                        logger.warning(f"Falha ao atualizar job {job_id} para success")
+                        return False
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute("UPDATE job_carteirinhas SET status='success', locked_by=NULL, locked_at=NULL, locked_until=NULL, updated_at=NOW() WHERE id=%s", (job_id,))
+                self.connection.commit()
+            except Exception:
+                cursor.close()
+                return False
+            cursor.close()
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao marcar job {job_id} como processado: {e}")
+            return False
+
+    def mark_job_failed(self, job_id: str, error: str) -> bool:
+        try:
+            if getattr(self, 'supabase', None):
+                try:
+                    self.supabase.table('job_carteirinhas').update({
+                        'status': 'error',
+                        'error': error,
+                        'locked_by': None,
+                        'locked_at': None,
+                        'locked_until': None,
+                        'updated_at': datetime.now().isoformat()
+                    }).eq('id', job_id).execute()
+                    return True
+                except Exception:
+                    try:
+                        cursor = self.connection.cursor()
+                        cursor.execute("UPDATE job_carteirinhas SET status='error', error=%s, locked_by=NULL, locked_at=NULL, locked_until=NULL, updated_at=NOW() WHERE id=%s", (error, job_id))
+                        self.connection.commit()
+                        cursor.close()
+                        return True
+                    except Exception as _:
+                        logger.warning(f"Falha ao atualizar job {job_id} para error")
+                        return False
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute("UPDATE job_carteirinhas SET status='error', error=%s, locked_by=NULL, locked_at=NULL, locked_until=NULL, updated_at=NOW() WHERE id=%s", (error, job_id))
+                self.connection.commit()
+            except Exception:
+                cursor.close()
+                return False
+            cursor.close()
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao marcar job {job_id} como erro: {e}")
+            return False
+
+    def get_carteirinhas_with_appointments(self, data):
+        """Retorna carteirinhas com agendamentos para uma data específica"""
+        try:
+            cursor = self.connection.cursor()
+            query = """
+                SELECT DISTINCT c.carteiras as carteirinha, c.paciente 
+                FROM carteirinhas c
+                INNER JOIN agendamentos a ON c.carteiras = a.carteirinha
+                WHERE a.data = %s
+                ORDER BY c.paciente
+            """
+            cursor.execute(query, (data,))
+            results = cursor.fetchall()
+            cursor.close()
+            
+            carteirinhas = []
+            for result in results:
+                carteirinhas.append({
+                    'carteirinha': result[0],
+                    'paciente': result[1]
+                })
+            
+            return carteirinhas
+        except Exception as e:
+            logger.error(f"Erro ao buscar carteirinhas com agendamentos: {str(e)}")
+            return []
+
+    def mark_job_success_by_carteirinha(self, carteirinha: str) -> bool:
+        try:
+            # Tentar via Supabase REST: atualizar job em processing com carteirinha correspondente
+            if getattr(self, 'supabase', None):
+                try:
+                    res = (
+                        self.supabase
+                            .table('job_carteirinhas')
+                            .update({
+                                'status': 'success',
+                                'locked_by': None,
+                                'locked_at': None,
+                                'locked_until': None,
+                                'updated_at': datetime.now().isoformat()
+                            })
+                            .eq('carteirinha', carteirinha)
+                            .eq('status', 'processing')
+                            .execute()
+                    )
+                    data = getattr(res, 'data', None) or []
+                    if len(data) > 0:
+                        return True
+                except Exception as e:
+                    logger.warning(f"Supabase REST mark_job_success_by_carteirinha falhou: {e}")
+            # Fallback SQL direto
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute(
+                    """
+                    UPDATE job_carteirinhas
+                       SET status='success',
+                           locked_by=NULL,
+                           locked_at=NULL,
+                           locked_until=NULL,
+                           updated_at=NOW()
+                     WHERE carteirinha=%s AND status='processing'
+                    """,
+                    (carteirinha,)
+                )
+                self.connection.commit()
+                rows = cursor.rowcount
+                cursor.close()
+                return rows > 0
+            except Exception as e:
+                cursor.close()
+                logger.error(f"Erro ao marcar sucesso por carteirinha {carteirinha}: {e}")
+                return False
+        except Exception as e:
+            logger.error(f"Falha mark_job_success_by_carteirinha: {e}")
+            return False
+
+    def has_recent_success_for_carteirinha(self, carteirinha: str, min_hours: int = 6) -> bool:
+        try:
+            cutoff_iso = (datetime.now() - timedelta(hours=min_hours)).isoformat()
+            if getattr(self, 'supabase', None):
+                try:
+                    res = (
+                        self.supabase
+                            .table('job_carteirinhas')
+                            .select('id, updated_at')
+                            .eq('type', 'sgucard')
+                            .eq('carteirinha', carteirinha)
+                            .eq('status', 'success')
+                            .gte('updated_at', cutoff_iso)
+                            .limit(1)
+                            .execute()
+                    )
+                    data = getattr(res, 'data', None) or []
+                    return len(data) > 0
+                except Exception as e:
+                    logger.warning(f"Supabase REST has_recent_success_for_carteirinha falhou: {e}")
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute(
+                    """
+                    SELECT 1
+                      FROM job_carteirinhas
+                     WHERE type='sgucard'
+                       AND carteirinha=%s
+                       AND status='success'
+                       AND updated_at >= NOW() - (%s || ' hours')::interval
+                    LIMIT 1
+                    """,
+                    (carteirinha, str(min_hours))
+                )
+                row = cursor.fetchone()
+                cursor.close()
+                return bool(row)
+            except Exception as e:
+                cursor.close()
+                logger.error(f"Erro ao verificar sucesso recente para carteirinha {carteirinha}: {e}")
+                return False
+        except Exception as e:
+            logger.error(f"Falha has_recent_success_for_carteirinha: {e}")
+            return False
+
+    def has_active_processing_for_carteirinha(self, carteirinha: str) -> bool:
+        try:
+            now_iso = datetime.now().isoformat()
+            if getattr(self, 'supabase', None):
+                try:
+                    res = (
+                        self.supabase
+                            .table('job_carteirinhas')
+                            .select('id, locked_until')
+                            .eq('type', 'sgucard')
+                            .eq('carteirinha', carteirinha)
+                            .eq('status', 'processing')
+                            .gte('locked_until', now_iso)
+                            .limit(1)
+                            .execute()
+                    )
+                    data = getattr(res, 'data', None) or []
+                    return len(data) > 0
+                except Exception as e:
+                    logger.warning(f"Supabase REST has_active_processing_for_carteirinha falhou: {e}")
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute(
+                    """
+                    SELECT 1
+                      FROM job_carteirinhas
+                     WHERE type='sgucard'
+                       AND carteirinha=%s
+                       AND status='processing'
+                       AND locked_until >= NOW()
+                    LIMIT 1
+                    """,
+                    (carteirinha,)
+                )
+                row = cursor.fetchone()
+                cursor.close()
+                return bool(row)
+            except Exception as e:
+                cursor.close()
+                logger.error(f"Erro ao verificar processing ativo para carteirinha {carteirinha}: {e}")
+                return False
+        except Exception as e:
+            logger.error(f"Falha has_active_processing_for_carteirinha: {e}")
+            return False
+
+    def mark_job_processed(self, job_id: str) -> bool:
+        try:
+            if getattr(self, 'supabase', None):
+                try:
+                    self.supabase.table('job_carteirinhas').update({
+                        'status': 'success',
+                        'locked_by': None,
+                        'locked_at': None,
+                        'locked_until': None,
+                        'updated_at': datetime.now().isoformat()
+                    }).eq('id', job_id).execute()
+                    return True
+                except Exception:
+                    try:
+                        cursor = self.connection.cursor()
+                        cursor.execute("UPDATE job_carteirinhas SET status='success', locked_by=NULL, locked_at=NULL, locked_until=NULL, updated_at=NOW() WHERE id=%s", (job_id,))
+                        self.connection.commit()
+                        cursor.close()
+                        return True
+                    except Exception as _:
+                        logger.warning(f"Falha ao atualizar job {job_id} para success")
+                        return False
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute("UPDATE job_carteirinhas SET status='success', locked_by=NULL, locked_at=NULL, locked_until=NULL, updated_at=NOW() WHERE id=%s", (job_id,))
+                self.connection.commit()
+            except Exception:
+                cursor.close()
+                return False
+            cursor.close()
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao marcar job {job_id} como processado: {e}")
+            return False
+
+    def mark_job_failed(self, job_id: str, error: str) -> bool:
+        try:
+            if getattr(self, 'supabase', None):
+                try:
+                    self.supabase.table('job_carteirinhas').update({
+                        'status': 'error',
+                        'error': error,
+                        'locked_by': None,
+                        'locked_at': None,
+                        'locked_until': None,
+                        'updated_at': datetime.now().isoformat()
+                    }).eq('id', job_id).execute()
+                    return True
+                except Exception:
+                    try:
+                        cursor = self.connection.cursor()
+                        cursor.execute("UPDATE job_carteirinhas SET status='error', error=%s, locked_by=NULL, locked_at=NULL, locked_until=NULL, updated_at=NOW() WHERE id=%s", (error, job_id))
+                        self.connection.commit()
+                        cursor.close()
+                        return True
+                    except Exception as _:
+                        logger.warning(f"Falha ao atualizar job {job_id} para error")
+                        return False
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute("UPDATE job_carteirinhas SET status='error', error=%s, locked_by=NULL, locked_at=NULL, locked_until=NULL, updated_at=NOW() WHERE id=%s", (error, job_id))
+                self.connection.commit()
+            except Exception:
+                cursor.close()
+                return False
+            cursor.close()
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao marcar job {job_id} como erro: {e}")
+            return False
+
     def get_carteirinhas_with_appointments(self, data):
         """Retorna carteirinhas com agendamentos para uma data específica"""
         try:
@@ -601,6 +1083,12 @@ class AutomacaoCarteirinhas:
                     
                     if resultado['sucesso']:
                         logger.info("Automação real executada com sucesso")
+                        # Marcador de conclusão: gravar success no job correspondente
+                        try:
+                            if carteirinha:
+                                self.db_manager.mark_job_success_by_carteirinha(carteirinha)
+                        except Exception as e:
+                            logger.warning(f"Falha ao marcar success por carteirinha {carteirinha}: {e}")
                         return {
                             'status': 'sucesso',
                             'message': 'Web scraping real executado com sucesso',
