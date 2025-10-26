@@ -1,6 +1,7 @@
 # Ignore environment and local config
 .env
 .env.*
+!.env.example
 
 # Python cache and artifacts
 __pycache__/
