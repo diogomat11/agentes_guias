@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 from typing import List, Dict, Optional, Union
 import json
+import hashlib
 import win32com.client as win32
 from supabase import create_client, Client
 
@@ -84,6 +85,35 @@ class DatabaseManager:
             self.connection.rollback()
             logger.error(f"Erro ao executar query: {e}")
             raise
+
+    def acquire_worker_lock(self, worker_id: str) -> bool:
+        """Tenta adquirir um advisory lock exclusivo para o worker."""
+        try:
+            # Key estável baseada no worker_id
+            key_src = f"sgucard_worker:{worker_id}".encode("utf-8")
+            key = int(hashlib.sha1(key_src).hexdigest()[:16], 16) % (2**63 - 1)
+            cursor = self.connection.cursor()
+            cursor.execute("SELECT pg_try_advisory_lock(%s)", (key,))
+            row = cursor.fetchone()
+            cursor.close()
+            return bool(row and row[0])
+        except Exception as e:
+            logger.error(f"Falha ao adquirir worker lock: {e}")
+            return False
+
+    def release_worker_lock(self, worker_id: str) -> bool:
+        """Libera o advisory lock exclusivo do worker, se detido."""
+        try:
+            key_src = f"sgucard_worker:{worker_id}".encode("utf-8")
+            key = int(hashlib.sha1(key_src).hexdigest()[:16], 16) % (2**63 - 1)
+            cursor = self.connection.cursor()
+            cursor.execute("SELECT pg_advisory_unlock(%s)", (key,))
+            row = cursor.fetchone()
+            cursor.close()
+            return bool(row and row[0])
+        except Exception as e:
+            logger.error(f"Falha ao liberar worker lock: {e}")
+            return False
     
     def get_carteirinhas_for_processing(self, modo: str, carteirinha_especifica: str = None, 
                                       data_inicial: date = None, data_final: date = None) -> List[Dict]:

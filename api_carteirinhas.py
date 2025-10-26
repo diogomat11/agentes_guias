@@ -134,10 +134,17 @@ async def verificar_carteirinha_endpoint(
     """Verifica uma carteirinha específica conforme prompt.yaml"""
     try:
         # Usar função vasculhar_carteirinhas para carteirinha específica
-        resultado = get_automacao().vasculhar_carteirinhas(
+        automacao = get_automacao()
+        resultado = automacao.vasculhar_carteirinhas(
             modo_execucao="manual",
             carteirinha=request.carteirinha
         )
+        # Se houve sucesso na verificação, marcar o job como success imediatamente
+        try:
+            if resultado.get('status') == 'sucesso' and request.carteirinha:
+                automacao.db_manager.mark_job_success_by_carteirinha(request.carteirinha)
+        except Exception as e:
+            logger.warning(f"Falha ao marcar success por carteirinha {request.carteirinha}: {e}")
         
         return {
             "status": "sucesso" if resultado.get('status') == 'sucesso' else "erro",
