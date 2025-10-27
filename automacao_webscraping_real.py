@@ -9,6 +9,7 @@ import time
 import datetime
 import logging
 import os
+import threading
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from typing import List
@@ -28,6 +29,7 @@ driver = None
 Benef_cart = None
 arrterapias = [0] * 8
 db_manager = None
+_session_manager = None
 
 def get_supabase_client() -> Client | None:
     """Inicializa cliente Supabase via REST para fallback de persistência."""
@@ -521,6 +523,143 @@ def obter_carteirinhas_por_modo(modo: str = 'todos', carteirinha: str = None, da
         print(f"Erro ao obter carteirinhas por modo: {e}")
         return []
 
+# Adiciona gerenciador de sessão de Chrome persistente
+class ChromeSessionManager:
+    def __init__(self):
+        self.driver = None
+        self.lock = threading.Lock()
+        self.busy = False
+        self.last_used = 0.0
+        self.idle_minutes = int((os.getenv("CHROME_IDLE_MINUTES", "30") or "30"))
+        self._monitor_thread = threading.Thread(target=self._monitor_idle, daemon=True)
+        self._monitor_thread.start()
+
+    def _build_options(self) -> Options:
+        chrome_options = Options()
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-infobars")
+        headless_env = (os.getenv("SGUCARD_HEADLESS", "false") or "false").strip().lower()
+        if headless_env in ("1", "true", "yes", "on"):
+            chrome_options.add_argument("--headless=new")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--window-size=1920,1080")
+        return chrome_options
+
+    def _perform_login(self, driver):
+        login_user = os.getenv("SGUCARD_LOGIN", "REC2209525")
+        login_pass = os.getenv("SGUCARD_PASSWORD", "Unimed@2025")
+        # Navega à página de login e efetua login, se necessário
+        try:
+            driver.get("https://sgucard.unimedgoiania.coop.br/cmagnet/Login.do")
+            # Espera campos do login, se não já autenticado
+            for _ in range(10):
+                if is_element_present(driver, (By.ID, "login"), timeout=1) and is_element_present(driver, (By.ID, "passwordTemp"), timeout=1):
+                    break
+                # Se já estiver na home, sai do loop
+                if is_element_present(driver, oCheck.XPath('//*[@id="cadastro_biometria"]/div/div[2]/span'), timeout=1):
+                    return
+                time.sleep(0.5)
+            if is_element_present(driver, (By.ID, "login"), timeout=2):
+                login_elem = driver.find_element(By.ID, "login")
+                passwordTemp = driver.find_element(By.ID, "passwordTemp")
+                Button_DoLogin = driver.find_element(By.ID, "Button_DoLogin")
+                login_elem.clear()
+                login_elem.send_keys(login_user)
+                time.sleep(0.5)
+                passwordTemp.clear()
+                passwordTemp.send_keys(login_pass)
+                Button_DoLogin.click()
+                time.sleep(3)
+        except Exception:
+            # Em qualquer falha, apenas prossegue; consultas tratarão refreshs
+            pass
+
+    def ensure_logged_in_and_home(self, driver):
+        try:
+            # Se estiver na home, nada a fazer
+            if is_element_present(driver, oCheck.XPath('//*[@id="cadastro_biometria"]/div/div[2]/span'), timeout=2):
+                return
+            # Se ver campos de login, loga
+            if is_element_present(driver, (By.ID, "passwordTemp"), timeout=1) or is_element_present(driver, (By.ID, "login"), timeout=1):
+                self._perform_login(driver)
+                return
+            # Caso contrário, tenta ir à página de login e logar
+            self._perform_login(driver)
+        except Exception:
+            pass
+
+    def get_or_create_driver(self):
+        if self.driver is None:
+            try:
+                logging.getLogger(__name__).info("[session] Criando nova instância de ChromeDriver")
+                self.driver = webdriver.Chrome(options=self._build_options())
+                try:
+                    self.driver.maximize_window()
+                except Exception:
+                    pass
+                time.sleep(1)
+                self._perform_login(self.driver)
+                self.last_used = time.time()
+            except Exception as e:
+                logging.getLogger(__name__).error(f"Falha ao criar ChromeDriver: {e}")
+                raise
+        else:
+            logging.getLogger(__name__).info("[session] Reutilizando ChromeDriver existente")
+        return self.driver
+
+    def acquire_session(self):
+        self.lock.acquire()
+        self.busy = True
+        return self.get_or_create_driver()
+
+    def release_session(self):
+        self.last_used = time.time()
+        self.busy = False
+        try:
+            self.lock.release()
+        except Exception:
+            pass
+
+    def close_driver(self):
+        try:
+            if self.driver:
+                try:
+                    self.driver.quit()
+                except Exception:
+                    pass
+                self.driver = None
+        finally:
+            self.busy = False
+            self.last_used = time.time()
+
+    def _monitor_idle(self):
+        # Verifica a cada 60s; quando passar do idle, aguarda estar livre e fecha
+        while True:
+            try:
+                time.sleep(60)
+                if not self.driver:
+                    continue
+                idle_minutes = (time.time() - self.last_used) / 60.0
+                if idle_minutes >= self.idle_minutes:
+                    if not self.busy:
+                        self.close_driver()
+                    else:
+                        # Checa a cada 2 min até que fique livre, então fecha
+                        while self.busy:
+                            time.sleep(120)
+                        self.close_driver()
+            except Exception:
+                # Evita que qualquer exceção mate o monitor
+                pass
+
+
+def get_session_manager() -> ChromeSessionManager:
+    global _session_manager
+    if _session_manager is None:
+        _session_manager = ChromeSessionManager()
+    return _session_manager
+
 def ConsultGuias(driver, carteirinhas_list: List[str]):
     global Benef_cart
     total_rows = len(carteirinhas_list)
@@ -579,7 +718,7 @@ def ConsultGuias(driver, carteirinhas_list: List[str]):
             print(f"Erro ao processar carteira {Benef_cart}:", str(e))
             continue
     print("\nProcessamento finalizado")
-    driver.quit()
+    # Não encerra o Chrome aqui; o gerenciador cuidará do ciclo de vida
 
 def SGUCARD(modo: str = 'todos', carteirinha: str = None, data_inicial: str = None, data_final: str = None):
     global driver
@@ -617,11 +756,11 @@ def SGUCARD(modo: str = 'todos', carteirinha: str = None, data_inicial: str = No
 class WebScrapingRealAutomacao:
     def executar_automacao_completa(self, filtro_api: str = "manual", carteira: str = None, data_inicio: str = None, data_fim: str = None) -> dict:
         """Interface compatível com automacao_carteirinhas.vasculhar_carteirinhas.
-        Executa o SGUCARD conforme o filtro e retorna resumo.
+        Executa com sessão persistente por padrão; fallback para SGUCARD se desativado.
         """
         start_ts = time.time()
         try:
-            # Mapear o filtro para o modo usado em SGUCARD/obter_carteirinhas_por_modo
+            # Mapear o filtro para o modo usado em obter_carteirinhas_por_modo
             if filtro_api == "manual" and carteira:
                 modo = "unico"
             elif filtro_api == "intervalo" and data_inicio and data_fim:
@@ -634,10 +773,21 @@ class WebScrapingRealAutomacao:
                 lista = obter_carteirinhas_por_modo(modo, carteira, data_inicio, data_fim)
                 count_carteirinhas = len(lista)
             except Exception:
+                lista = []
                 count_carteirinhas = 0
 
-            # Executa automação real (abre Chrome respeitando SGUCARD_HEADLESS)
-            SGUCARD(modo=modo, carteirinha=carteira, data_inicial=data_inicio, data_final=data_fim)
+            use_persistent = (os.getenv("PERSISTENT_CHROME", "true").strip().lower() in ("1", "true", "yes", "on"))
+            if use_persistent:
+                mgr = get_session_manager()
+                drv = mgr.acquire_session()
+                try:
+                    mgr.ensure_logged_in_and_home(drv)
+                    ConsultGuias(drv, lista)
+                finally:
+                    mgr.release_session()
+            else:
+                # Fluxo antigo (abre e encerra a cada execução)
+                SGUCARD(modo=modo, carteirinha=carteira, data_inicial=data_inicio, data_final=data_fim)
 
             elapsed = int(time.time() - start_ts)
             hh = elapsed // 3600
@@ -646,7 +796,6 @@ class WebScrapingRealAutomacao:
             return {
                 "sucesso": True,
                 "carteirinhas_processadas": count_carteirinhas,
-                # Sem contador de guias no fluxo atual; retornamos 0 por ora
                 "guias_extraidas": 0,
                 "tempo_execucao": f"{hh:02d}:{mm:02d}:{ss:02d}"
             }

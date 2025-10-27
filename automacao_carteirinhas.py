@@ -1,10 +1,5 @@
-"""
-Automação de Verificação de Carteirinhas e Sincronização Supabase
-Script principal reestruturado para trabalhar com banco de dados Supabase
-"""
-
 import os
-import psycopg2
+import psycopg
 import schedule
 import time
 import logging
@@ -20,10 +15,7 @@ from supabase import create_client, Client
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('automacao_carteirinhas.log'),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
@@ -34,8 +26,7 @@ class DatabaseManager:
         load_dotenv()
         self.connection = None
         self._connect()
-        
-        # Inicializar cliente Supabase para compatibilidade com API
+        # Inicializar cliente Supabase
         try:
             supabase_url = os.getenv('SUPABASE_URL')
             supabase_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
@@ -55,12 +46,13 @@ class DatabaseManager:
             supabase_url = os.getenv('SUPABASE_URL')
             project_id = supabase_url.replace('https://', '').replace('.supabase.co', '')
             
-            self.connection = psycopg2.connect(
+            self.connection = psycopg.connect(
                 host=f'db.{project_id}.supabase.co',
-                database='postgres',
+                dbname='postgres',
                 user='postgres',
                 password=os.getenv('SUPABASE_PASSWORD'),
-                port='5432'
+                port='5432',
+                sslmode='require'
             )
             logger.info("Conexão com banco de dados estabelecida")
         except Exception as e:
@@ -404,9 +396,12 @@ class DatabaseManager:
             if not getattr(self, 'supabase', None):
                 logger.warning("Supabase não inicializado; claim_jobs retorna vazio")
                 return []
+            vt = int(os.getenv("VISIBILITY_TIMEOUT_SECONDS", "900"))
             res = self.supabase.rpc('claim_jobs', {
                 'worker_id': worker_id,
-                'claim_limit': claim_limit
+                'claim_limit': claim_limit,
+                'p_visibility_timeout_seconds': vt,
+                'job_type': 'sgucard'
             }).execute()
             data = getattr(res, 'data', None)
             if data is None:
@@ -435,20 +430,85 @@ class DatabaseManager:
             return False
 
     def fail_job(self, job_id: str, worker_id: str, error: str) -> bool:
-        """Marca job como falho e retorna para 'pending' ou 'error' conforme tentativas."""
+        """Marca job como falho e libera o lock; funciona com Supabase ou SQL."""
         try:
-            if not getattr(self, 'supabase', None):
-                logger.warning("Supabase não inicializado; fail_job ignorado")
+            if getattr(self, 'supabase', None):
+                try:
+                    res = self.supabase.rpc('fail_job', {
+                        'job_id': job_id,
+                        'worker_id': worker_id,
+                        'error': error
+                    }).execute()
+                    data = getattr(res, 'data', None)
+                    if bool(data):
+                        return True
+                except Exception as e:
+                    logger.warning(f"Supabase RPC fail_job falhou: {e}")
+            # Fallback SQL: atualiza somente se o lock pertencer ao worker
+            try:
+                cursor = self.connection.cursor()
+                cursor.execute(
+                    """
+                    UPDATE job_carteirinhas
+                       SET status='error',
+                           error=%s,
+                           locked_by=NULL,
+                           locked_at=NULL,
+                           locked_until=NULL,
+                           updated_at=NOW()
+                     WHERE id=%s AND locked_by=%s AND status='processing'
+                    """,
+                    (error, job_id, worker_id)
+                )
+                self.connection.commit()
+                rows = cursor.rowcount
+                cursor.close()
+                return rows > 0
+            except Exception as e:
+                logger.error(f"Erro SQL fallback fail_job para job {job_id}: {e}")
                 return False
-            res = self.supabase.rpc('fail_job', {
-                'job_id': job_id,
-                'worker_id': worker_id,
-                'error': error
-            }).execute()
-            data = getattr(res, 'data', None)
-            return bool(data)
         except Exception as e:
             logger.error(f"Erro ao marcar falha no job {job_id}: {e}")
+            return False
+
+    def release_job(self, job_id: str, worker_id: str) -> bool:
+        """Libera job em processing para voltar a pending; tenta RPC e faz fallback SQL."""
+        try:
+            if getattr(self, 'supabase', None):
+                try:
+                    res = self.supabase.rpc('release_job', {
+                        'job_id': job_id,
+                        'worker_id': worker_id,
+                    }).execute()
+                    data = getattr(res, 'data', None)
+                    if bool(data):
+                        return True
+                except Exception as e:
+                    logger.warning(f"Supabase RPC release_job falhou: {e}")
+            # Fallback SQL direto
+            try:
+                cursor = self.connection.cursor()
+                cursor.execute(
+                    """
+                    UPDATE job_carteirinhas
+                       SET status='pending',
+                           locked_by=NULL,
+                           locked_at=NULL,
+                           locked_until=NULL,
+                           updated_at=NOW()
+                     WHERE id=%s AND locked_by=%s AND status='processing'
+                    """,
+                    (job_id, worker_id)
+                )
+                self.connection.commit()
+                rows = cursor.rowcount
+                cursor.close()
+                return rows > 0
+            except Exception as e:
+                logger.error(f"Erro SQL fallback release_job para job {job_id}: {e}")
+                return False
+        except Exception as e:
+            logger.error(f"Erro ao liberar job {job_id}: {e}")
             return False
 
     # Fallback simples baseado em tabela job_carteirinhas
@@ -483,27 +543,32 @@ class DatabaseManager:
         try:
             statuses = statuses or ['pending', 'error']
             if getattr(self, 'supabase', None):
-                # Buscar por múltiplos status via Supabase REST
-                res = (
-                    self.supabase
-                        .table('job_carteirinhas')
-                        .select('*')
-                        .eq('type', 'sgucard')
-                        .in_('status', statuses)
-                        .order('created_at', desc=False)
-                        .limit(limit)
-                        .execute()
-                )
-                data = getattr(res, 'data', None) or []
-                return data
-            # Fallback SQL direto
+                now_iso = datetime.now().isoformat()
+                # Buscar por múltiplos status via Supabase REST com filtro de lock (null ou expirado)
+                try:
+                    res = (
+                        self.supabase
+                            .table('job_carteirinhas')
+                            .select('*')
+                            .eq('type', 'sgucard')
+                            .in_('status', statuses)
+                            .or_(f"locked_until.is.null,locked_until.lt.{now_iso}")
+                            .order('created_at', desc=False)
+                            .limit(limit)
+                            .execute()
+                    )
+                    data = getattr(res, 'data', None) or []
+                    return data
+                except Exception as e:
+                    logger.warning(f"Supabase REST fetch_jobs_simple com filtro de lock falhou: {e}")
+            # Fallback SQL direto com filtro de lock
             cursor = self.connection.cursor()
-            # Montar placeholders para IN
             placeholders = ','.join(['%s'] * len(statuses))
             query = (
-                f"SELECT id, type, carteirinha, carteira, id_paciente "
+                f"SELECT id, type, carteirinha, carteira, id_paciente, status "
                 f"FROM job_carteirinhas "
                 f"WHERE type = 'sgucard' AND status IN ({placeholders}) "
+                f"AND (locked_until IS NULL OR locked_until < NOW()) "
                 f"ORDER BY created_at ASC LIMIT %s"
             )
             cursor.execute(query, (*statuses, limit))
@@ -511,11 +576,50 @@ class DatabaseManager:
             cursor.close()
             jobs = []
             for r in rows:
-                jobs.append({'id': r[0], 'type': r[1], 'carteirinha': r[2], 'carteira': r[3], 'id_paciente': r[4]})
+                jobs.append({'id': r[0], 'type': r[1], 'carteirinha': r[2], 'carteira': r[3], 'id_paciente': r[4], 'status': r[5]})
             return jobs
         except Exception as e:
             logger.error(f"Erro ao buscar jobs simples: {e}")
             return []
+
+    def purge_stale_processing(self, job_type: str = 'sgucard') -> int:
+        """Reabre jobs 'processing' cujo locked_until já expirou, devolvendo contagem de afetados."""
+        try:
+            if getattr(self, 'supabase', None):
+                try:
+                    res = self.supabase.rpc('purge_stale_processing', {'job_type': job_type}).execute()
+                    data = getattr(res, 'data', None)
+                    if isinstance(data, dict) and 'count' in data:
+                        return int(data['count'])
+                    if isinstance(data, (int, float)):
+                        return int(data)
+                except Exception as e:
+                    logger.warning(f"Supabase RPC purge_stale_processing falhou: {e}")
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute(
+                    """
+                    UPDATE job_carteirinhas
+                       SET status='pending',
+                           locked_by=NULL,
+                           locked_at=NULL,
+                           locked_until=NULL,
+                           updated_at=NOW()
+                     WHERE type=%s AND status='processing' AND locked_until < NOW()
+                    """,
+                    (job_type,)
+                )
+                count = cursor.rowcount
+                self.connection.commit()
+                cursor.close()
+                return int(count or 0)
+            except Exception as e:
+                cursor.close()
+                logger.error(f"Erro SQL fallback purge_stale_processing: {e}")
+                return 0
+        except Exception as e:
+            logger.error(f"Falha em purge_stale_processing: {e}")
+            return 0
 
     def start_job_processing(self, job_id: str, worker_id: str, visibility_timeout_seconds: int = 900) -> bool:
         try:
@@ -549,13 +653,13 @@ class DatabaseManager:
                     SET status='processing',
                         locked_by=%s,
                         locked_at=NOW(),
-                        locked_until=NOW() + (visibility_timeout_seconds || ' seconds')::interval,
+                        locked_until=NOW() + (%s || ' seconds')::interval,
                         attempts=attempts+1,
                         updated_at=NOW()
                     WHERE id=%s AND status IN ('pending','error')
                     RETURNING id
                     """,
-                    (worker_id, job_id)
+                    (worker_id, visibility_timeout_seconds, job_id)
                 )
                 updated = cursor.fetchone()
                 self.connection.commit()

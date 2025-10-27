@@ -441,33 +441,37 @@ async def estatisticas_sistema():
             "timestamp": datetime.now().isoformat()
         }
         
+        # Contagens via SQL direto (robusto e por tabela)
+        for alias, table in [
+            ("total_carteirinhas", "carteirinhas"),
+            ("total_agendamentos", "agendamentos"),
+            ("total_guias", "baseguias"),
+            ("total_pagamentos", "pagamentos"),
+        ]:
+            try:
+                result = db_manager.execute_query(f"SELECT COUNT(*) FROM {table}", fetch=True)
+                stats[alias] = result[0][0] if result else stats[alias]
+            except Exception:
+                pass
+        
+        # Se habilitado, sobrepor contagens via cliente Supabase
         try:
-            # Contar carteirinhas
-            result = db_manager.supabase.table("carteirinhas").select("id", count="exact").execute()
-            stats["total_carteirinhas"] = result.count or 0
-        except:
+            use_supabase_stats = os.getenv("USE_SUPABASE_STATS", "false").lower() == "true"
+            if use_supabase_stats and getattr(db_manager, "supabase", None):
+                res = db_manager.supabase.table("carteirinhas").select("id", count="exact").execute()
+                stats["total_carteirinhas"] = res.count or stats["total_carteirinhas"]
+                res = db_manager.supabase.table("pagamentos").select("id", count="exact").execute()
+                stats["total_pagamentos"] = res.count or stats["total_pagamentos"]
+                res = db_manager.supabase.table("agendamentos").select("id_atendimento", count="exact").execute()
+                stats["total_agendamentos"] = res.count or stats["total_agendamentos"]
+                res = db_manager.supabase.table("baseguias").select("id", count="exact").execute()
+                stats["total_guias"] = res.count or stats["total_guias"]
+        except Exception:
             pass
-            
+        
         try:
-            # Contar pagamentos
-            result = db_manager.supabase.table("pagamentos").select("id", count="exact").execute()
-            stats["total_pagamentos"] = result.count or 0
-        except:
-            pass
-            
-        try:
-            # Contar agendamentos
-            # Usar coluna correta da chave primária
-            result = db_manager.supabase.table("agendamentos").select("id_atendimento", count="exact").execute()
-            stats["total_agendamentos"] = result.count or 0
-        except:
-            pass
-            
-        try:
-            # Contar guias
-            result = db_manager.supabase.table("baseguias").select("id", count="exact").execute()
-            stats["total_guias"] = result.count or 0
-        except:
+            db_manager.close()
+        except Exception:
             pass
         
         return stats

@@ -53,7 +53,7 @@ def trigger_webscraping_real(carteirinha: str) -> Dict:
         f"-H 'Authorization: Bearer {token}'"
     )
     logger.info(f"[worker] Enviando requisição (real): {curl_cmd}")
-    resp = requests.post(url, params=params, headers=headers, timeout=int(os.getenv("CARTEIRINHA_API_TIMEOUT", "60")))
+    resp = requests.post(url, params=params, headers=headers, timeout=int(os.getenv("CARTEIRINHA_API_TIMEOUT", "900")))
     resp.raise_for_status()
     try:
         return resp.json()
@@ -78,7 +78,7 @@ def trigger_verificar_carteirinha(carteirinha: str, base_url: str = None) -> Dic
         f"-d '{json.dumps(payload)}'"
     )
     logger.info(f"[worker] Enviando requisição: {curl_cmd}")
-    resp = requests.post(url, json=payload, headers=headers, timeout=int(os.getenv("CARTEIRINHA_API_TIMEOUT", "30")))
+    resp = requests.post(url, json=payload, headers=headers, timeout=int(os.getenv("CARTEIRINHA_API_TIMEOUT", "900")))
     resp.raise_for_status()
     try:
         return resp.json()
@@ -97,7 +97,7 @@ def _extract_error_from_result(result: Dict) -> str:
     return str(msg)
 
 
-def worker_loop(worker_id: str, claim_batch: int = 1, poll_interval: int = 5):
+def worker_loop(worker_id: str, claim_batch: int = 1, poll_interval: int = 60):
     """Loop principal do worker: consome jobs e distribui entre múltiplos servidores com healthcheck."""
     servers_env = os.getenv("API_SERVER_URLS", "").strip()
     servers: List[str] = [u.strip().rstrip('/') for u in servers_env.split(',') if u.strip()]
@@ -158,12 +158,12 @@ def worker_loop(worker_id: str, claim_batch: int = 1, poll_interval: int = 5):
             else:
                 err_msg = _extract_error_from_result(result)
                 logger.warning(f"[slot {slot_id}] API retornou erro para job={job_id}: {err_msg}")
-                ok = db.fail_job(job_id, slot_id, err_msg)
+                ok = db.mark_job_failed(job_id, err_msg)
                 if not ok:
                     logger.warning(f"[slot {slot_id}] Falha ao marcar erro para job {job_id}")
         except Exception as call_err:
             logger.warning(f"[slot {slot_id}] Falha ao chamar API para job={job_id}: {call_err}")
-            ok = db.fail_job(job_id, slot_id, f"API call failed: {call_err}")
+            ok = db.mark_job_failed(job_id, f"API call failed: {call_err}")
             if not ok:
                 logger.warning(f"[slot {slot_id}] Falha ao marcar erro para job {job_id}")
         finally:
@@ -172,6 +172,14 @@ def worker_loop(worker_id: str, claim_batch: int = 1, poll_interval: int = 5):
 
     while True:
         try:
+            # Reabrir jobs 'processing' com lock expirado (prioridade 3)
+            try:
+                purged = db.purge_stale_processing('sgucard')
+                if purged:
+                    logger.info(f"Reabertos {purged} jobs processing expirados")
+            except Exception as e:
+                logger.warning(f"Falha ao purgar processing expirados: {e}")
+
             with busy_lock:
                 free_servers = [srv for srv in servers if not server_busy[srv] and is_server_healthy(srv)]
             if not free_servers:
@@ -191,6 +199,7 @@ def worker_loop(worker_id: str, claim_batch: int = 1, poll_interval: int = 5):
                 time.sleep(poll_interval)
                 continue
 
+            dispatch_stagger = int(os.getenv("DISPATCH_STAGGER_SECONDS", "5"))
             ji = 0
             for server_url in free_servers:
                 if ji >= len(jobs):
@@ -201,18 +210,19 @@ def worker_loop(worker_id: str, claim_batch: int = 1, poll_interval: int = 5):
                 carteirinha = job.get("carteirinha") or job.get("carteira")
                 if not carteirinha:
                     logger.warning(f"Job {job_id} sem carteirinha; marcando como falho")
-                    ok = db.fail_job(job_id, worker_id, "Job sem carteirinha")
+                    ok = db.mark_job_failed(job_id, "Job sem carteirinha")
                     if not ok:
                         logger.warning(f"Falha ao marcar erro para job {job_id}")
                     continue
                 status_job = str(job.get("status", "")).lower()
-                if status_job in ("success", "processing"):
-                    logger.info(f"Pulando job {job_id} status={status_job} (success/processing).")
+                is_claimed = (status_job == "processing")
+                if status_job == "success":
+                    logger.info(f"Pulando job {job_id} status={status_job} (success).")
                     continue
 
                 slot_id = f"{worker_id}:{servers.index(server_url)+1}"
                 vt = int(os.getenv("VISIBILITY_TIMEOUT_SECONDS", "900"))
-                started = db.start_job_processing(job_id, slot_id, visibility_timeout_seconds=vt)
+                started = True if is_claimed else db.start_job_processing(job_id, slot_id, visibility_timeout_seconds=vt)
                 if not started:
                     logger.info(f"Job {job_id} não pôde ser iniciado (status mudou ou em processamento). Pulando.")
                     continue
@@ -221,6 +231,7 @@ def worker_loop(worker_id: str, claim_batch: int = 1, poll_interval: int = 5):
                     server_busy[server_url] = True
                 t = threading.Thread(target=process_job_on_server, args=(job, server_url, slot_id), daemon=True)
                 t.start()
+                time.sleep(dispatch_stagger)
 
             time.sleep(poll_interval)
         except KeyboardInterrupt:
@@ -237,5 +248,5 @@ def worker_loop(worker_id: str, claim_batch: int = 1, poll_interval: int = 5):
 
 if __name__ == "__main__":
     worker_id = os.getenv("WORKER_ID", "worker-carteirinhas")
-    poll_interval = int(os.getenv("POLL_INTERVAL_SECONDS", "5"))
+    poll_interval = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
     worker_loop(worker_id, poll_interval=poll_interval)
